@@ -9,7 +9,7 @@ export default function UsageChart() {
     const [chartData, setChartData] = useState(null);
 
     const loadData = async () => {
-        const res = await fetch("http://127.0.0.1:8000/api/usage/stats?days=7", {
+        const res = await fetch("http://localhost:5000/api/usage/stats?days=7", {
             headers: {
                 "Authorization": "Bearer " + token
             }
