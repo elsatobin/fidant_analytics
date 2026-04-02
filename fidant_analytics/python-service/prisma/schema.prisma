@@ -7,15 +7,16 @@ generator client {
   provider = "prisma-client-py"
 }
 
+// Pre-computed daily aggregates to avoid scanning raw events on every stats request.
+// Past days are cached indefinitely; today's row is refreshed within a TTL window.
 model DailyUsageCache {
-  id        Int      @id @default(autoincrement())
-  userId    Int
-  date      DateTime
-  committed Int
-  reserved  Int
-  limit     Int
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  dateKey     String   @db.VarChar(10)  // "YYYY-MM-DD" — matches daily_usage_events.date_key
+  committed   Int
+  dailyLimit  Int
+  // cachedAt is updated on every write; used to detect stale today-entries
+  cachedAt    DateTime @default(now())
 
-  @@unique([userId, date])
+  @@unique([userId, dateKey])
 }

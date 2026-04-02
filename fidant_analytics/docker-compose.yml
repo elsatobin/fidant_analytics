@@ -6,9 +6,9 @@ services:
     container_name: fidant_postgres
     restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: fidant_db
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: mydb
     ports:
       - "5432:5432"
     volumes:

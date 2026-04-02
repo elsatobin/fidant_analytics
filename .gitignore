@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.env
+
+# Node
+node_modules/
+build/
+.DS_Store
+npm-debug.log*

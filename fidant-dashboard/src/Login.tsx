@@ -25,11 +25,14 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
       const data = await res.json();
 
       if (res.ok && data.access_token) {
-        localStorage.setItem("access_token", data.access_token); // Store token in localStorage
-        onLoginSuccess?.(data.access_token); // Send token to parent component
-        console.log("Login success:", data);
+        localStorage.setItem("access_token", data.access_token);
+        onLoginSuccess?.(data.access_token);
       } else {
-        setError(data.detail || "Login failed");
+        // detail may be a string or {error: string} depending on the error type
+        const detail = data.detail;
+        setError(
+          typeof detail === "string" ? detail : detail?.error ?? "Login failed"
+        );
       }
     } catch (err) {
       console.error(err);

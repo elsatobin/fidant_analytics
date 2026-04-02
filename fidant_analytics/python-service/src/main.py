@@ -1,83 +1,186 @@
-from fastapi import FastAPI, Depends, Query, HTTPException, Header
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from datetime import datetime, timedelta
-from pydantic import BaseModel
 import sys
 from pathlib import Path
 
-sys.path.append(str(Path(__file__).parent)) 
-# src/main.py
-from db import Base, engine, get_db 
+sys.path.append(str(Path(__file__).parent))
+
+from fastapi import FastAPI, Depends, Query, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from pydantic import BaseModel
+
+from db import Base, engine, get_db
 import models
 from auth import decode_token, create_access_token
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # React dev
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create tables
 Base.metadata.create_all(bind=engine)
 
-PLAN_LIMITS = {
+PLAN_LIMITS: Dict[str, int] = {
     "starter": 30,
     "pro": 100,
-    "executive": 500
+    "executive": 500,
 }
 
-# 🔐 Get current user from JWT
+# Cache is considered fresh if written within the last 5 minutes.
+# Past days are cached indefinitely (they can't change).
+CACHE_TTL_SECONDS = 300
+
+
 def get_current_user(
     authorization: str = Header(None),
-    db: Session = Depends(get_db)
-):
+    db: Session = Depends(get_db),
+) -> models.User:
     if not authorization:
-        raise HTTPException(status_code=401, detail="Missing token")
+        raise HTTPException(status_code=401, detail={"error": "Missing token"})
 
-    token = authorization.replace("Bearer ", "")
+    token = authorization.removeprefix("Bearer ")
     payload = decode_token(token)
 
     if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail={"error": "Invalid or expired token"})
 
     user_id = payload.get("user_id")
     user = db.query(models.User).filter(models.User.id == user_id).first()
 
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail={"error": "User not found"})
 
     return user
 
-# 🔧 Generate list of dates
-def generate_dates(days: int):
+
+def generate_date_list(days: int) -> List[str]:
     today = datetime.utcnow().date()
     return [
         (today - timedelta(days=i)).strftime("%Y-%m-%d")
         for i in reversed(range(days))
     ]
 
-# ✅ Pydantic model for login request
+
+def _is_today(date_key: str) -> bool:
+    return date_key == datetime.utcnow().date().strftime("%Y-%m-%d")
+
+
+def _fetch_committed_from_events(
+    db: Session, user_id: int, date_keys: List[str]
+) -> Dict[str, int]:
+    """Query raw events table for committed counts on given dates."""
+    rows = (
+        db.query(models.DailyUsageEvent.date_key, func.count().label("count"))
+        .filter(models.DailyUsageEvent.user_id == user_id)
+        .filter(models.DailyUsageEvent.status == "committed")
+        .filter(models.DailyUsageEvent.date_key.in_(date_keys))
+        .group_by(models.DailyUsageEvent.date_key)
+        .all()
+    )
+    return {r[0]: r[1] for r in rows}
+
+
+def _upsert_cache(
+    db: Session, user_id: int, date_key: str, committed: int, daily_limit: int
+) -> None:
+    """Write or refresh a cache row using upsert."""
+    stmt = (
+        pg_insert(models.DailyUsageCache)
+        .values(
+            user_id=user_id,
+            date_key=date_key,
+            committed=committed,
+            daily_limit=daily_limit,
+            cached_at=datetime.utcnow(),
+        )
+        .on_conflict_do_update(
+            constraint="uq_cache_user_date",
+            set_={
+                "committed": committed,
+                "daily_limit": daily_limit,
+                "cached_at": datetime.utcnow(),
+            },
+        )
+    )
+    db.execute(stmt)
+    db.commit()
+
+
+def get_committed_map(
+    db: Session, user_id: int, date_list: List[str], daily_limit: int
+) -> Dict[str, int]:
+    """
+    Return committed counts per date_key.
+    Strategy:
+      - For past days: use cache if present, otherwise query events and populate cache.
+      - For today: use cache only if cached_at is within CACHE_TTL_SECONDS, else re-query.
+    """
+    now = datetime.utcnow()
+    staleness_cutoff = now - timedelta(seconds=CACHE_TTL_SECONDS)
+
+    cached_rows = (
+        db.query(models.DailyUsageCache)
+        .filter(models.DailyUsageCache.user_id == user_id)
+        .filter(models.DailyUsageCache.date_key.in_(date_list))
+        .all()
+    )
+    cache_map: Dict[str, models.DailyUsageCache] = {r.date_key: r for r in cached_rows}
+
+    result: Dict[str, int] = {}
+    missing: List[str] = []
+
+    for date_key in date_list:
+        cached = cache_map.get(date_key)
+        if cached is None:
+            missing.append(date_key)
+            continue
+
+        # Today's cache is only valid within TTL
+        if _is_today(date_key) and cached.cached_at < staleness_cutoff:
+            missing.append(date_key)
+            continue
+
+        result[date_key] = cached.committed
+
+    if missing:
+        fresh = _fetch_committed_from_events(db, user_id, missing)
+        for date_key in missing:
+            count = fresh.get(date_key, 0)
+            result[date_key] = count
+            _upsert_cache(db, user_id, date_key, count, daily_limit)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+
 class LoginRequest(BaseModel):
     email: str
 
-# 🔐 Login endpoint
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.post("/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
-    email = req.email
-    user = db.query(models.User).filter(models.User.email == email).first()
-
+    user = db.query(models.User).filter(models.User.email == req.email).first()
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
+        raise HTTPException(status_code=401, detail={"error": "Invalid credentials"})
     token = create_access_token({"user_id": user.id})
     return {"access_token": token}
 
-# 🔹 Usage stats endpoint
+
 @app.get("/api/usage/stats")
 def get_usage_stats(
     days: int = Query(7, ge=1, le=90),
@@ -87,56 +190,43 @@ def get_usage_stats(
     plan = user.plan_tier
     daily_limit = PLAN_LIMITS.get(plan, 30)
 
-    date_list = generate_dates(days)
+    date_list = generate_date_list(days)
     start_date = date_list[0]
     end_date = date_list[-1]
 
-    # Committed events
-    committed_rows = (
-        db.query(models.DailyUsageEvent.date_key, func.count().label("count"))
-        .filter(models.DailyUsageEvent.user_id == user.id)
-        .filter(models.DailyUsageEvent.status == "committed")
-        .filter(models.DailyUsageEvent.date_key.between(start_date, end_date))
-        .group_by(models.DailyUsageEvent.date_key)
-        .all()
-    )
-    committed_map = {r[0]: r[1] for r in committed_rows}
+    committed_map = get_committed_map(db, user.id, date_list, daily_limit)
 
-    # Reserved events (within last 15 minutes)
+    # Active reservations: status=reserved, reserved_at within last 15 minutes
     cutoff = datetime.utcnow() - timedelta(minutes=15)
     reserved_rows = (
         db.query(models.DailyUsageEvent.date_key, func.count().label("count"))
         .filter(models.DailyUsageEvent.user_id == user.id)
         .filter(models.DailyUsageEvent.status == "reserved")
         .filter(models.DailyUsageEvent.reserved_at >= cutoff)
-        .filter(models.DailyUsageEvent.date_key.between(start_date, end_date))
+        .filter(models.DailyUsageEvent.date_key.in_(date_list))
         .group_by(models.DailyUsageEvent.date_key)
         .all()
     )
-    reserved_map = {r[0]: r[1] for r in reserved_rows}
+    reserved_map: Dict[str, int] = {r[0]: r[1] for r in reserved_rows}
 
-    # Prepare daily data
-    days_data = []
-    for d in date_list:
-        committed = committed_map.get(d, 0)
-        reserved = reserved_map.get(d, 0)
-        days_data.append({
+    days_data = [
+        {
             "date": d,
-            "committed": committed,
-            "reserved": reserved,
+            "committed": committed_map.get(d, 0),
+            "reserved": reserved_map.get(d, 0),
             "limit": daily_limit,
-            "utilization": round(committed / daily_limit, 2) if daily_limit else 0
-        })
+            "utilization": round(committed_map.get(d, 0) / daily_limit, 2) if daily_limit else 0,
+        }
+        for d in date_list
+    ]
 
-    # Prepare summary
-    total_committed = sum(d["committed"] for d in days_data)
-    avg_daily = round(total_committed / days, 2) if days else 0
-    peak_day = max(days_data, key=lambda x: x["committed"]) if days_data else None
+    total_committed = sum(day["committed"] for day in days_data)
+    avg_daily = round(total_committed / days, 2)
+    peak = max(days_data, key=lambda x: x["committed"])
 
-    # Current streak
     streak = 0
-    for d in reversed(days_data):
-        if d["committed"] > 0:
+    for day in reversed(days_data):
+        if day["committed"] > 0:
             streak += 1
         else:
             break
@@ -149,15 +239,12 @@ def get_usage_stats(
         "summary": {
             "total_committed": total_committed,
             "avg_daily": avg_daily,
-            "peak_day": {
-                "date": peak_day["date"],
-                "count": peak_day["committed"]
-            } if peak_day else None,
-            "current_streak": streak
-        }
+            "peak_day": {"date": peak["date"], "count": peak["committed"]},
+            "current_streak": streak,
+        },
     }
 
-# 🔹 Seed a test user
+
 @app.get("/seed-user")
 def seed_user(db: Session = Depends(get_db)):
     user = db.query(models.User).filter_by(email="test@test.com").first()
