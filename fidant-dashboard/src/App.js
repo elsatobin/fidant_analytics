@@ -1,12 +1,21 @@
-import React from "react";
-import UsageChart from "./UsageChart";
+// App.js
+import React, { useState } from "react";
+import { Login } from "./Login";
+import { UsageStats } from "./components/UsageStats";
 
 function App() {
-    return (
-        <div className="App">
-            <UsageChart />
-        </div>
-    );
+  const [loggedIn, setLoggedIn] = useState(false);
+
+  return (
+    <div>
+      {!loggedIn ? (
+        <Login onLoginSuccess={() => setLoggedIn(true)} />
+      ) : (
+        <UsageStats />
+      )}
+    </div>
+  );
 }
 
+// ✅ default export
 export default App;
